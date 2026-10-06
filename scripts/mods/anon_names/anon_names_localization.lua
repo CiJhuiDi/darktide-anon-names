@@ -67,8 +67,4 @@ return {
 		en = "Show the game's original bot name",
 		["zh-cn"] = "机器人显示游戏原名",
 	},
-	apply_to_accounts = {
-		en = "Also Rename Account Names",
-		["zh-cn"] = "账户名也一起改",
-	},
 }

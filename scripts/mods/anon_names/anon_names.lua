@@ -295,10 +295,8 @@ mod.rewrite_mask = function (profile, real_name, is_account, masked)
 
 		key = bot
 	else
-		if is_account and not mod:get("apply_to_accounts") then
-			return masked
-		end
-
+		-- 账号名要不要匿名完全由 AnonPlayers 决定（它的「其他账户名称 / 你的账户名称」设置），
+		-- 这里不再叠加自己的一层开关 —— 它匿名我们就换化名，它放行我们就放行
 		key = alias_key(profile, real_name, is_account)
 	end
 

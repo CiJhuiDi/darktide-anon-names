@@ -36,7 +36,8 @@
 |---|---|---|
 | 化名风格 `mask_style` | 二十四节气 | `jieqi` / `flora` / `flower` / `herb` / `vine` / `tree` / `garden` / `star` / `mixed` / `off` |
 | 机器人 `bot_handling` | 开（也用化名） | `开` 机器人也用化名 / `关` 保持 AnonPlayers 的 `???` / `显示游戏原名` |
-| 账户名也一起改 `apply_to_accounts` | 开 | 仅当 AnonPlayers 也匿名账号名时才有区别（它默认不匿名账号名） |
+
+**账号名不设开关**：账号名要不要匿名完全由 AnonPlayers 的「其他账户名称 / 你的账户名称」决定，本 mod 只跟随——它匿名就换化名，它放行就放行。
 
 ## 化名池
 

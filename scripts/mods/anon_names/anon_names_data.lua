@@ -40,11 +40,6 @@ return {
 				default_value = "use_pool",
 				options       = bot_dropdown,
 			},
-			{
-				setting_id    = "apply_to_accounts",
-				type          = "checkbox",
-				default_value = true,
-			},
 		},
 	},
 }
