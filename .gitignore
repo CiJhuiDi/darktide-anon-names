@@ -1,0 +1,9 @@
+# 发布压缩包不进源码仓库，GitHub Release 走 zip
+*.zip
+*.rar
+release/
+__pycache__/
+*.pyc
+# 内部文档：不进公开仓库（本地保留）
+PROJECT_HANDOFF.md
+开发文档.md

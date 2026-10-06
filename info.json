@@ -1,0 +1,20 @@
+{
+  "name": "Anon Names",
+  "description": "Replaces AnonPlayers masks with 24 solar terms or flower/plant pseudonyms: one stable alias per player, no duplicates inside a squad.",
+  "version": "1.0.0",
+  "author": "CiJhuiDi",
+  "dependencies": {
+    "required": [
+      "AnonPlayers"
+    ],
+    "self_after": [
+      "AnonPlayers"
+    ]
+  },
+  "localization": {
+    "zh-cn": {
+      "name": "匿名名池",
+      "description": "把 AnonPlayers 的掩码换成二十四节气或花草名：同一玩家全程同一个化名，同队不撞名。"
+    }
+  }
+}
