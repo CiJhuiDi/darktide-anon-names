@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.0.2
+	匿名名池 (Anon Names) v1.0.3
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：不改它「谁该被匿名」的决定，只替换「用什么名字」。
@@ -297,19 +297,81 @@ end
 --
 -- v1.0.1 曾把「判定不了」当成「不是我」，结果把玩家自己的名字也匿名了（v1.0.2 修）。
 
+-- ##########################################################
+-- ################## 「我的角色」集合 ######################
+-- 让「这是不是我」从「猜」变成**决定性**判断。
+--
+-- 为什么需要：角色选择界面里**未选中的、同一个账号下的其他角色**，character_id 与当前角色不同。
+-- 只比 local_player 的 cid 会把它误判成「别人」→ 拿 anon_others 去裁决 → 我自己的其他角色被化名
+--（2026-10-09 用户实测反馈）。
+--
+-- Managers.data_service.profiles:fetch_all_profiles() 返回本账号全部角色，实测结构：
+--     { gear = ..., selected_profile = { character_id = <当前角色> },
+--       profiles = { [1..7] = { character_id = "...", name = "CJDYZ..." } } }
+-- 缓存成集合后判据就确定了：
+--     cid 在集合里        → **是我**（含未选中的其他角色）
+--     cid 不在集合里      → **确证是别人**（集合涵盖本账号全部角色）
+-- 集合没加载好之前不下这种结论，退回下面的保守判据。
+local my_character_ids = {}
+local my_characters_loaded = false
+local last_character_refresh = -math.huge
+local CHARACTER_REFRESH_INTERVAL = 60
+
+local function refresh_my_characters()
+	local now = os.time and os.time() or nil
+
+	if now and (now - last_character_refresh) < CHARACTER_REFRESH_INTERVAL then
+		return
+	end
+
+	last_character_refresh = now or 0
+
+	local data_service = Managers.data_service
+	local service = data_service and data_service.profiles
+
+	if not service or type(service.fetch_all_profiles) ~= "function" then
+		return
+	end
+
+	local ok, promise = pcall(function ()
+		return service:fetch_all_profiles()
+	end)
+
+	if not ok or type(promise) ~= "table" or type(promise.next) ~= "function" then
+		return
+	end
+
+	promise:next(function (data)
+		local list = type(data) == "table" and data.profiles
+
+		if type(list) ~= "table" then
+			return
+		end
+
+		local ids = {}
+
+		for _, profile in pairs(list) do
+			local character_id = type(profile) == "table" and profile.character_id
+
+			if type(character_id) == "string" and character_id ~= "" then
+				ids[character_id] = true
+			end
+		end
+
+		my_character_ids = ids
+		my_characters_loaded = true
+	end)
+end
+
 -- 「是不是我」的三态判定：true = 确定是我 / false = 确定不是我 / **nil = 判定不了**。
 -- 调用方**只有拿到 false（确证是别人）才允许覆盖上游放行的真名**；nil 必须放行。
 --
--- 为什么必须三态（2026-10-09 实测踩到）：本机 profile 的 account_id 是 nil，
--- 而账号名 / presence 路径传进来的 profile 可能**没有 character_id**。
--- 旧实现遇到这种情况返回 false（=「不是我」），于是拿 anon_others = 3 去裁决我自己的名字
--- → **把玩家自己的名字也匿名了**。判定不了就应该什么都不做。
---
 -- 判据优先级：
 --   1. 引用相同（hub / 任务里 hook 收到的就是同一个 profile 表）
---   2. character_id 相同（跨场景副本；两边的 id 都有效才可判定）
---   3. account_id 相同（本机 HumanPlayer._account_id 与 profile.account_id）
--- 三条都不成立 → nil。
+--   2. **「我的角色」集合**（最强）：在集合里 = 我；集合已加载且不在其中 = 确证是别人
+--   3. character_id 与 local_player 的当前角色相同 → 我
+--   4. account_id 与 local_player:account_id() 相同 → 我
+-- 都不成立 → nil。
 local function local_profile_state(profile)
 	if type(profile) ~= "table" then
 		return nil
@@ -337,16 +399,32 @@ local function local_profile_state(profile)
 		end
 	end
 
-	if type(my_profile) == "table" then
-		if my_profile == profile then
+	if type(my_profile) == "table" and my_profile == profile then
+		return true
+	end
+
+	local character_id = profile.character_id
+	local has_character_id = type(character_id) == "string" and character_id ~= ""
+
+	if has_character_id then
+		if my_character_ids[character_id] then
 			return true
 		end
 
-		local mine = my_profile.character_id
-		local theirs = profile.character_id
+		if my_characters_loaded then
+			-- 集合里有本账号全部角色，不在其中就是别人 —— 这是修主菜单泄漏的关键一票
+			return false
+		end
 
-		if type(mine) == "string" and mine ~= "" and type(theirs) == "string" and theirs ~= "" then
-			return theirs == mine
+		-- 集合还没建好：催一次，本次先退回下面的保守判据
+		refresh_my_characters()
+	end
+
+	if type(my_profile) == "table" then
+		local mine = my_profile.character_id
+
+		if type(mine) == "string" and mine ~= "" and has_character_id and mine == character_id then
+			return true
 		end
 	end
 
@@ -379,6 +457,151 @@ local function others_masked(is_account)
 	end
 
 	return value ~= 0 and value ~= false
+end
+
+-- ##########################################################
+-- ################## 账号名兜底 ############################
+-- AnonPlayers 只 hook 了 PlayerInfo.user_display_name，**完全没碰 account_name /
+-- platform_persona_name_or_account_name**。实测（2026-10-09，hub 里 14 个玩家）：
+--     entry:character_name() → 化名 ✓
+--     entry:account_name()   → Huanyan#6301（真名）✗
+-- 而反编译源码**恰好缺 ui/ 目录**（UI 在字节码里），无法排除界面直接取账号名来显示。
+-- 这里按与主路径同一套判定补一层：我自己放行（尊重 anon_my_account = 0），
+-- 别人且上游「他人」设置要求匿名时换成化名；化名 key 用账号 id，与角色名保持一致。
+
+local function local_account_id()
+	-- presence 的「我自己」最可靠：hub 和主菜单都在
+	local presence = Managers.presence
+	local myself = presence and presence._myself
+
+	if myself and type(myself.account_id) == "function" then
+		local ok, value = pcall(function ()
+			return myself:account_id()
+		end)
+
+		if ok and type(value) == "string" and value ~= "" then
+			return value
+		end
+	end
+
+	local player_manager = Managers.player
+
+	if player_manager and type(player_manager.local_player) == "function" then
+		local ok, local_player = pcall(function ()
+			return player_manager:local_player(1)
+		end)
+
+		if ok and local_player and type(local_player.account_id) == "function" then
+			local ok_acc, value = pcall(function ()
+				return local_player:account_id()
+			end)
+
+			if ok_acc and type(value) == "string" and value ~= "" then
+				return value
+			end
+		end
+	end
+
+	return nil
+end
+
+local function mask_account_name(self, name)
+	local style = mod:get("mask_style")
+	local pool = POOLS[style]
+
+	if type(name) ~= "string" or name == "" or not style or style == "off" or not pool then
+		return name
+	end
+
+	if not others_masked(true) then
+		return name
+	end
+
+	local account_id
+
+	if type(self.account_id) == "function" then
+		local ok, value = pcall(function ()
+			return self:account_id()
+		end)
+
+		if ok and type(value) == "string" and value ~= "" then
+			account_id = value
+		end
+	end
+
+	local my_account_id = local_account_id()
+
+	if account_id and my_account_id and account_id == my_account_id then
+		return name -- 我自己的账号名
+	end
+
+	local profile
+
+	if type(self.character_profile) == "function" then
+		local ok, value = pcall(function ()
+			return self:character_profile()
+		end)
+
+		if ok and type(value) == "table" then
+			profile = value
+		end
+	end
+
+	if profile then
+		local state = local_profile_state(profile)
+
+		if state == true then
+			return name
+		end
+
+		if state == nil and not account_id then
+			return name -- 判定不了就不动
+		end
+	end
+
+	local key = account_id or (profile and profile.character_id)
+
+	if not key then
+		return name
+	end
+
+	return alias_for(key, pool)
+end
+
+local ACCOUNT_NAME_TARGETS = {
+	{ "PresenceEntryMyself", "account_name" },
+	{ "PresenceEntryImmaterium", "account_name" },
+}
+
+local function install_account_name_hooks()
+	if mod._account_hooked then
+		return true
+	end
+
+	local hooked_any = false
+
+	for _, target in ipairs(ACCOUNT_NAME_TARGETS) do
+		local class = CLASS[target[1]]
+
+		if class and type(class[target[2]]) == "function" then
+			local ok = pcall(function ()
+				mod:hook(class, target[2], function (func, self, ...)
+					return mask_account_name(self, func(self, ...))
+				end)
+			end)
+
+			if ok then
+				hooked_any = true
+			end
+		end
+	end
+
+	if hooked_any then
+		mod._account_hooked = true
+		mod:info("[anon_names] hooked presence account_name")
+	end
+
+	return hooked_any
 end
 
 -- ##########################################################
@@ -480,6 +703,12 @@ if not ok_early then
 end
 
 mod.on_all_mods_loaded = function (self)
+	-- 预热「本账号角色集合」：越早建好，判据越早从「保守」变成「决定性」
+	pcall(refresh_my_characters)
+
+	-- 补 AnonPlayers 没覆盖的账号名出口（presence account_name）
+	pcall(install_account_name_hooks)
+
 	local ok, hooked = pcall(install_hook)
 
 	if ok and hooked then
