@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.0.1
+	匿名名池 (Anon Names) v1.0.2
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：不改它「谁该被匿名」的决定，只替换「用什么名字」。
@@ -287,48 +287,78 @@ end
 --     基线：      别人角色名 → 化名「含羞草」
 --     伪装主菜单：别人角色名 → 真名（上游 is_me 短路 + anon_me = 0）
 --
--- 所以这里补一层甄别：上游返回真名时，只有**确认是本地玩家**才放行；
--- 是别人则回头读上游的「他人」设置（anon_others / anon_other_accounts）重新裁决：
---   * 他人的设置本来就要求匿名（本次实测 anon_others = 3）→ 上游是被 is_me 短路骗了 → 我们换成化名
---   * 他人的设置明确是 0（不匿名他人）→ 尊重上游/用户的显式选择，照抄真名
--- 这样既不覆盖用户的显式设置，又堵住主菜单那条泄漏路径。
+-- 所以这里补一层甄别（**三态**，见 local_profile_state）：上游返回真名时
+--   * 确实是我 → 放行（尊重 anon_me / anon_my_account = 0）
+--   * **确证是别人** → 回头读上游的「他人」设置（anon_others / anon_other_accounts）重新裁决：
+--       该匿名就换化名；显式设 0（不匿名他人）时仍照抄
+--   * 判定不了（拿不到本机档案 / profile 缺 id）→ **放行**，什么都不动
+-- 这样既不覆盖用户的显式设置、又不误伤自己，同时堵住主菜单那条泄漏路径。
 -- 该分支只在「上游放行真名」时才进入，平时零开销。
+--
+-- v1.0.1 曾把「判定不了」当成「不是我」，结果把玩家自己的名字也匿名了（v1.0.2 修）。
 
--- 是不是本地玩家本人。判据用 player_manager 的本地档案（比 view_active 可靠）：
--- 先比引用（hub 里 hook 收到的是同一个 profile），再比 character_id
--- （跨场景/跨副本时 profile 实例不同，但同一个角色的 character_id 相同）。
-local function is_local_profile(profile)
+-- 「是不是我」的三态判定：true = 确定是我 / false = 确定不是我 / **nil = 判定不了**。
+-- 调用方**只有拿到 false（确证是别人）才允许覆盖上游放行的真名**；nil 必须放行。
+--
+-- 为什么必须三态（2026-10-09 实测踩到）：本机 profile 的 account_id 是 nil，
+-- 而账号名 / presence 路径传进来的 profile 可能**没有 character_id**。
+-- 旧实现遇到这种情况返回 false（=「不是我」），于是拿 anon_others = 3 去裁决我自己的名字
+-- → **把玩家自己的名字也匿名了**。判定不了就应该什么都不做。
+--
+-- 判据优先级：
+--   1. 引用相同（hub / 任务里 hook 收到的就是同一个 profile 表）
+--   2. character_id 相同（跨场景副本；两边的 id 都有效才可判定）
+--   3. account_id 相同（本机 HumanPlayer._account_id 与 profile.account_id）
+-- 三条都不成立 → nil。
+local function local_profile_state(profile)
 	if type(profile) ~= "table" then
-		return false
+		return nil
 	end
 
 	local player_manager = Managers.player
+	local my_profile
+	local my_account_id
 
-	if not player_manager or type(player_manager.local_player) ~= "function" then
-		return false
+	if player_manager and type(player_manager.local_player) == "function" then
+		local ok, local_player = pcall(function ()
+			return player_manager:local_player(1)
+		end)
+
+		if ok and local_player then
+			my_profile = local_player._profile
+
+			local ok_acc, account_id = pcall(function ()
+				return local_player:account_id()
+			end)
+
+			if ok_acc then
+				my_account_id = account_id
+			end
+		end
 	end
 
-	local ok, local_player = pcall(function ()
-		return player_manager:local_player(1)
-	end)
+	if type(my_profile) == "table" then
+		if my_profile == profile then
+			return true
+		end
 
-	if not ok or not local_player then
-		return false
+		local mine = my_profile.character_id
+		local theirs = profile.character_id
+
+		if type(mine) == "string" and mine ~= "" and type(theirs) == "string" and theirs ~= "" then
+			return theirs == mine
+		end
 	end
 
-	local my_profile = local_player._profile
+	if type(my_account_id) == "string" and my_account_id ~= "" then
+		local theirs = profile.account_id
 
-	if type(my_profile) ~= "table" then
-		return false
+		if type(theirs) == "string" and theirs ~= "" then
+			return theirs == my_account_id
+		end
 	end
 
-	if my_profile == profile then
-		return true
-	end
-
-	local mine = my_profile.character_id
-
-	return type(mine) == "string" and mine ~= "" and mine == profile.character_id
+	return nil
 end
 
 -- 上游的「他人」设置是否要求匿名。0 = 用户明确要求不匿名他人（含账号名），照抄真名；
@@ -377,9 +407,9 @@ mod.rewrite_mask = function (profile, real_name, is_account, masked)
 			return masked
 		end
 	elseif masked == real_name then
-		-- 上游返回真名：确认是本地玩家、或用户明确要求不匿名他人时，跟随放行；
-		-- 否则是 main_menu_view 短路把别人当成了「我」（见文件上方说明），继续走化名
-		if is_local_profile(profile) or not others_masked(is_account) then
+		-- 上游返回真名。**只有确证是别人、且上游的他人设置要求匿名时才覆盖**；
+		-- 是我、或判定不了（nil）一律放行 —— 绝不能把玩家自己的名字改掉
+		if local_profile_state(profile) ~= false or not others_masked(is_account) then
 			return masked
 		end
 	end
