@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.0.3
+	匿名名池 (Anon Names) v1.0.4
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：不改它「谁该被匿名」的决定，只替换「用什么名字」。
@@ -205,20 +205,103 @@ local function hash_string(text)
 	return mix32(h)
 end
 
--- key 优先级：account_id（跨角色稳定）→ character_id → 真名字符串兜底
--- 账号名与角色名共用同一个 key，保证同一个玩家只有一个化名
+-- character_id → account_id 映射。
+-- 为什么需要：不同路径传进来的 profile **携带的 id 不一样** ——
+-- presence / players 的 profile 只有 character_id（account_id = nil），
+-- 而带账号维度的出口（account_name、hook_origin 版 user_display_name）能给出 account_id。
+-- 只按「account_id 优先」取 key，同一个玩家就会在两处拿到**两个不同的化名**。
+-- 2026-10-09 用户实测「同一个人的名字多处不一样」，活体复现（同一 cid）：
+--     只有 character_id          → 秋菊
+--     character_id + account_id  → 含笑
+-- 所以这里先把 cid → account_id 补齐，让**所有路径**解析到同一个 key。
+local character_accounts = {}
+local last_account_map_refresh = -math.huge
+local ACCOUNT_MAP_REFRESH_INTERVAL = 3
+
+local function refresh_character_accounts()
+	local now = os.time and os.time() or nil
+
+	if now and (now - last_account_map_refresh) < ACCOUNT_MAP_REFRESH_INTERVAL then
+		return
+	end
+
+	last_account_map_refresh = now or 0
+
+	local presence = Managers.presence
+	local by_account = presence and presence._presences_by_account_id
+
+	if type(by_account) == "table" then
+		for account_id, entry in pairs(by_account) do
+			if type(account_id) == "string" and account_id ~= "" then
+				local ok, profile = pcall(function ()
+					return entry:character_profile()
+				end)
+				local character_id = ok and type(profile) == "table" and profile.character_id
+
+				if type(character_id) == "string" and character_id ~= "" then
+					character_accounts[character_id] = account_id
+				end
+			end
+		end
+	end
+
+	local player_manager = Managers.player
+
+	if player_manager and type(player_manager.players) == "function" then
+		local ok, players = pcall(function ()
+			return player_manager:players()
+		end)
+
+		if ok and type(players) == "table" then
+			for _, player in pairs(players) do
+				local profile = player and player._profile
+				local character_id = type(profile) == "table" and profile.character_id
+
+				if type(character_id) == "string" and character_id ~= "" and type(player.account_id) == "function" then
+					local ok_acc, account_id = pcall(function ()
+						return player:account_id()
+					end)
+
+					if ok_acc and type(account_id) == "string" and account_id ~= "" then
+						character_accounts[character_id] = account_id
+					end
+				end
+			end
+		end
+	end
+end
+
+-- key：**统一到 account_id**（同一个人跨角色、跨界面只用同一个化名）。
+--   * profile 直接带 account_id → 顺手记下 cid→account_id 映射，用 account_id
+--   * 只带 character_id → 查映射补全；补不到才退回 character_id（并催一次映射刷新）
+--   * 都没有 → 真名字符串兜底
+-- 账号名与角色名共用这一套 key。
 local function alias_key(profile, real_name, is_account)
 	if type(profile) == "table" then
+		local character_id = profile.character_id
 		local account_id = profile.account_id
+		local has_character_id = type(character_id) == "string" and character_id ~= ""
+		local has_account_id = type(account_id) == "string" and account_id ~= ""
 
-		if type(account_id) == "string" and account_id ~= "" then
+		if has_character_id and has_account_id then
+			character_accounts[character_id] = account_id
+
 			return account_id
 		end
 
-		local character_id = profile.character_id
+		if has_character_id then
+			local mapped = character_accounts[character_id]
 
-		if type(character_id) == "string" and character_id ~= "" then
-			return character_id
+			if not mapped then
+				refresh_character_accounts()
+				mapped = character_accounts[character_id]
+			end
+
+			return mapped or character_id
+		end
+
+		if has_account_id then
+			return account_id
 		end
 	end
 
@@ -559,7 +642,16 @@ local function mask_account_name(self, name)
 		end
 	end
 
-	local key = account_id or (profile and profile.character_id)
+	-- 与角色名共用同一套 key（先补 cid→account_id 映射），保证同一个人只有一个化名
+	local key_profile = profile
+
+	if type(key_profile) ~= "table" then
+		key_profile = { account_id = account_id }
+	elseif not key_profile.account_id and account_id then
+		key_profile = { character_id = key_profile.character_id, account_id = account_id }
+	end
+
+	local key = alias_key(key_profile, name, true)
 
 	if not key then
 		return name
@@ -705,6 +797,9 @@ end
 mod.on_all_mods_loaded = function (self)
 	-- 预热「本账号角色集合」：越早建好，判据越早从「保守」变成「决定性」
 	pcall(refresh_my_characters)
+
+	-- 预热 cid→account_id 映射：让同一个人在所有路径解析到同一个 key（同一个化名）
+	pcall(refresh_character_accounts)
 
 	-- 补 AnonPlayers 没覆盖的账号名出口（presence account_name）
 	pcall(install_account_name_hooks)
