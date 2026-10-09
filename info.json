@@ -1,7 +1,7 @@
 {
   "name": "Anon Names",
   "description": "Replaces AnonPlayers masks with 24 solar terms or flower/plant pseudonyms: one stable alias per player, no duplicates inside a squad.",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "author": "CiJhuiDi",
   "dependencies": {
     "required": [

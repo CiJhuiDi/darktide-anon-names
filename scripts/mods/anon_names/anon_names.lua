@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.0.5
+	匿名名池 (Anon Names) v1.0.6
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：不改它「谁该被匿名」的决定，只替换「用什么名字」。
@@ -327,9 +327,39 @@ local function alias_key(profile, real_name, is_account)
 	return nil
 end
 
--- 唯一的分配逻辑：哈希取模。不查表、不记录、不重试
+-- 唯一的分配逻辑：哈希取模。不查表、不记录、不重试。
+-- v1.0.6 加一层「key → 化名」缓存：名字查询是**每帧级**的（日志实测单个玩家约 95 次/秒），
+-- 而 hash_string 每次都要把 key 逐字节跑一遍 djb2 + 两轮 mix32；缓存后只剩一次表查找。
+-- 池子（风格）换了整体失效，结果与纯哈希完全一致（同一 key 永远同一个化名）。
+local ALIAS_CACHE_LIMIT = 4000
+local alias_cache = {}
+local alias_cache_pool = nil
+local alias_cache_count = 0
+
 local function alias_for(key, pool)
-	return pool[(hash_string(key) % #pool) + 1]
+	if alias_cache_pool ~= pool then
+		alias_cache = {}
+		alias_cache_pool = pool
+		alias_cache_count = 0
+	end
+
+	local alias = alias_cache[key]
+
+	if alias then
+		return alias
+	end
+
+	alias = pool[(hash_string(key) % #pool) + 1]
+
+	if alias_cache_count >= ALIAS_CACHE_LIMIT then
+		alias_cache = {}
+		alias_cache_count = 0
+	end
+
+	alias_cache[key] = alias
+	alias_cache_count = alias_cache_count + 1
+
+	return alias
 end
 
 -- ##########################################################
@@ -358,6 +388,12 @@ local function bot_key(profile)
 	end)
 
 	if not ok or type(bots) ~= "table" then
+		return nil
+	end
+
+	-- 绝大多数场合没有机器人：先短路，省掉下面的 pairs 遍历
+	--（bot_key 对**每一次**名字查询都会走一遍，是 hot path）
+	if next(bots) == nil then
 		return nil
 	end
 
