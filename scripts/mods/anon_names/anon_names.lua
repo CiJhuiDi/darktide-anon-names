@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.0.0
+	匿名名池 (Anon Names) v1.0.1
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：不改它「谁该被匿名」的决定，只替换「用什么名字」。
@@ -273,6 +273,85 @@ local function bot_key(profile)
 end
 
 -- ##########################################################
+-- ################## 上游放行的甄别 ########################
+-- 上游 AnonPlayers 决定「谁该被匿名」，本 mod 只跟随。但它的 is_me 判据是**短路**的：
+--
+--     local is_me = Managers.ui and Managers.ui:view_active("main_menu_view") or _is_my_profile(profile)
+--
+-- 也就是「只要 main_menu_view 处于激活状态，任何 profile 都被当成我」。
+-- 后果：在主菜单看别人的角色名时，上游拿**我自己**的两个设置（anon_me / anon_my_account，
+-- 默认都是 0 = 不匿名）去裁决 → 直接 return real_name，真名穿透到社交 / 最近玩家列表。
+-- 本 mod 原来的判据是 `masked == real_name` 就当作「上游决定不匿名」照抄，于是跟着一起泄漏。
+--
+-- 2026-10-09 实测（dt-cli 把 view_active("main_menu_view") 临时伪装成 true）：
+--     基线：      别人角色名 → 化名「含羞草」
+--     伪装主菜单：别人角色名 → 真名（上游 is_me 短路 + anon_me = 0）
+--
+-- 所以这里补一层甄别：上游返回真名时，只有**确认是本地玩家**才放行；
+-- 是别人则回头读上游的「他人」设置（anon_others / anon_other_accounts）重新裁决：
+--   * 他人的设置本来就要求匿名（本次实测 anon_others = 3）→ 上游是被 is_me 短路骗了 → 我们换成化名
+--   * 他人的设置明确是 0（不匿名他人）→ 尊重上游/用户的显式选择，照抄真名
+-- 这样既不覆盖用户的显式设置，又堵住主菜单那条泄漏路径。
+-- 该分支只在「上游放行真名」时才进入，平时零开销。
+
+-- 是不是本地玩家本人。判据用 player_manager 的本地档案（比 view_active 可靠）：
+-- 先比引用（hub 里 hook 收到的是同一个 profile），再比 character_id
+-- （跨场景/跨副本时 profile 实例不同，但同一个角色的 character_id 相同）。
+local function is_local_profile(profile)
+	if type(profile) ~= "table" then
+		return false
+	end
+
+	local player_manager = Managers.player
+
+	if not player_manager or type(player_manager.local_player) ~= "function" then
+		return false
+	end
+
+	local ok, local_player = pcall(function ()
+		return player_manager:local_player(1)
+	end)
+
+	if not ok or not local_player then
+		return false
+	end
+
+	local my_profile = local_player._profile
+
+	if type(my_profile) ~= "table" then
+		return false
+	end
+
+	if my_profile == profile then
+		return true
+	end
+
+	local mine = my_profile.character_id
+
+	return type(mine) == "string" and mine ~= "" and mine == profile.character_id
+end
+
+-- 上游的「他人」设置是否要求匿名。0 = 用户明确要求不匿名他人（含账号名），照抄真名；
+-- 其余值（含读不到）按「应当匿名」处理 —— 拿不准时宁可匿名，这是本 mod 的定位。
+local function others_masked(is_account)
+	local anon_mod = get_mod("AnonPlayers")
+
+	if not anon_mod or type(anon_mod.get) ~= "function" then
+		return true
+	end
+
+	local ok, value = pcall(function ()
+		return anon_mod:get(is_account and "anon_other_accounts" or "anon_others")
+	end)
+
+	if not ok then
+		return true
+	end
+
+	return value ~= 0 and value ~= false
+end
+
+-- ##########################################################
 -- ################## 掩码改写 ##############################
 
 mod.rewrite_mask = function (profile, real_name, is_account, masked)
@@ -283,12 +362,6 @@ mod.rewrite_mask = function (profile, real_name, is_account, masked)
 		return masked
 	end
 
-	-- 返回真名 = AnonPlayers 决定不匿名（掩码模式 0），跟随它放行
-	if masked == real_name then
-		return masked
-	end
-
-	local key
 	local bot = bot_key(profile)
 
 	if bot then
@@ -303,13 +376,17 @@ mod.rewrite_mask = function (profile, real_name, is_account, masked)
 			-- 关：保持 AnonPlayers 的处理结果（通常是 ???）
 			return masked
 		end
-
-		key = bot
-	else
-		-- 账号名要不要匿名完全由 AnonPlayers 决定（它的「其他账户名称 / 你的账户名称」设置），
-		-- 这里不再叠加自己的一层开关 —— 它匿名我们就换化名，它放行我们就放行
-		key = alias_key(profile, real_name, is_account)
+	elseif masked == real_name then
+		-- 上游返回真名：确认是本地玩家、或用户明确要求不匿名他人时，跟随放行；
+		-- 否则是 main_menu_view 短路把别人当成了「我」（见文件上方说明），继续走化名
+		if is_local_profile(profile) or not others_masked(is_account) then
+			return masked
+		end
 	end
+
+	-- 账号名要不要匿名完全由 AnonPlayers 的「其他账户名称 / 你的账户名称」决定，
+	-- 本 mod 不再叠加自己的一层开关 —— 它匿名我们就换化名，它放行我们就放行
+	local key = bot or alias_key(profile, real_name, is_account)
 
 	if not key then
 		return masked
