@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.0.4
+	匿名名池 (Anon Names) v1.0.5
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：不改它「谁该被匿名」的决定，只替换「用什么名字」。
@@ -215,6 +215,7 @@ end
 --     character_id + account_id  → 含笑
 -- 所以这里先把 cid → account_id 补齐，让**所有路径**解析到同一个 key。
 local character_accounts = {}
+local account_map_logged = false
 local last_account_map_refresh = -math.huge
 local ACCOUNT_MAP_REFRESH_INTERVAL = 3
 
@@ -267,6 +268,20 @@ local function refresh_character_accounts()
 					end
 				end
 			end
+		end
+	end
+
+	-- 只报一次，便于从日志判断映射有没有真正建起来（诊断用）
+	if not account_map_logged then
+		local count = 0
+
+		for _ in pairs(character_accounts) do
+			count = count + 1
+		end
+
+		if count > 0 then
+			account_map_logged = true
+			mod:info("[anon_names] cid->account_id map built (%d entries)", count)
 		end
 	end
 end
@@ -397,10 +412,36 @@ end
 -- 集合没加载好之前不下这种结论，退回下面的保守判据。
 local my_character_ids = {}
 local my_characters_loaded = false
+local characters_logged = false
 local last_character_refresh = -math.huge
-local CHARACTER_REFRESH_INTERVAL = 60
+local CHARACTER_REFRESH_INTERVAL = 10
+
+-- 只在「游戏世界已就绪」之后才拉角色列表。
+-- fetch_all_profiles() 解析失败时会 `Managers.error:report_error(BackendError)` —— 会弹错误、
+-- 游戏直接进 error state；而**启动早期 master data 还没就绪**，正是它最容易失败的时机
+--（2026-10-09 日志实证：14:06:17 一次 BackendError，
+--  profiles_service.lua:196 ← master_items.lua:117 `rawget` got nil）。
+-- 游戏自己的 account_service 也会调它，但我们没必要在最危险的窗口里插一脚；
+-- 更关键的是：那一次失败会让本 mod 的「我的角色」集合建不起来 → 判据退化成 nil → **放行真名**。
+local function game_world_ready()
+	local player_manager = Managers.player
+
+	if not player_manager or type(player_manager.local_player) ~= "function" then
+		return false
+	end
+
+	local ok, local_player = pcall(function ()
+		return player_manager:local_player(1)
+	end)
+
+	return ok and local_player ~= nil and local_player._profile ~= nil
+end
 
 local function refresh_my_characters()
+	if my_characters_loaded or not game_world_ready() then
+		return
+	end
+
 	local now = os.time and os.time() or nil
 
 	if now and (now - last_character_refresh) < CHARACTER_REFRESH_INTERVAL then
@@ -443,6 +484,18 @@ local function refresh_my_characters()
 
 		my_character_ids = ids
 		my_characters_loaded = true
+
+		if not characters_logged then
+			characters_logged = true
+
+			local count = 0
+
+			for _ in pairs(ids) do
+				count = count + 1
+			end
+
+			mod:info("[anon_names] my character set loaded (%d characters)", count)
+		end
 	end)
 end
 
@@ -499,7 +552,17 @@ local function local_profile_state(profile)
 			return false
 		end
 
-		-- 集合还没建好：催一次，本次先退回下面的保守判据
+		-- 集合还没建好（启动后那几秒 / 请求失败）：退回 v1.0.2 的判据 ——
+		-- 与当前角色不同就**确证是别人**。宁可在这几秒里把「我的其他角色」也化名，
+		-- 也不能把真名放出去（2026-10-09 日志实证：启动后 27~36 秒泄漏了 1279 次真名）。
+		-- 角色选择界面里 local_player 通常还不存在 → my_profile 为 nil → 不会走到这里，所以不误伤。
+		local mine = type(my_profile) == "table" and my_profile.character_id
+
+		if type(mine) == "string" and mine ~= "" and mine ~= character_id then
+			return false
+		end
+
+		-- 催一次（内部会先检查游戏世界是否就绪）
 		refresh_my_characters()
 	end
 
@@ -795,10 +858,12 @@ if not ok_early then
 end
 
 mod.on_all_mods_loaded = function (self)
-	-- 预热「本账号角色集合」：越早建好，判据越早从「保守」变成「决定性」
-	pcall(refresh_my_characters)
+	-- 注意：**不要**在这里预热「我的角色」集合 —— on_all_mods_loaded 发生在游戏世界就绪之前，
+	-- 那时 fetch_all_profiles() 会因 master data 未就绪报 BackendError（弹错误 + 游戏进 error state），
+	-- 而且它一失败集合就建不起来 → 判据退化 → 放行真名。
+	-- refresh_my_characters() 内部有 game_world_ready() 守卫，会在进入世界后由 rewrite_mask 惰性触发。
 
-	-- 预热 cid→account_id 映射：让同一个人在所有路径解析到同一个 key（同一个化名）
+	-- 预热 cid→account_id 映射：只读 presence / players，安全
 	pcall(refresh_character_accounts)
 
 	-- 补 AnonPlayers 没覆盖的账号名出口（presence account_name）
