@@ -40,6 +40,13 @@ return {
 				default_value = "use_pool",
 				options       = bot_dropdown,
 			},
+			{
+				-- 游戏字体子集 = 本地化文本用字，比一级字库小得多（「枫」这种一级字都会变方块）。
+				-- 开启后把机器字体叠成 sc/tc/jp/kr 四套 fallback 链（游戏自带，不额外装字体文件）。
+				setting_id    = "cjk_font_fallback",
+				type          = "checkbox",
+				default_value = true,
+			},
 		},
 	},
 }

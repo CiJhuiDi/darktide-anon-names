@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.1.0
+	匿名名池 (Anon Names) v1.2.0
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：把它给出的掩码换成中文意象化名。
@@ -1106,6 +1106,201 @@ mod.update = function (self, dt)
 	end
 end
 
+-- ##########################################################
+-- ################## 中文字体 fallback #####################
+-- 为什么需要：游戏 zh-cn 的字体定义里 `machine_medium` 指向**单个** `noto_sans_sc_black`，
+-- 而那是「游戏本地化文本用字」的子集 —— 比 GB2312 一级字库小得多。
+-- 2026-10-12 截图实证：池子里的「五角**枫**」显示成「五角▯」，同屏的「五角」「云杉」却正常；
+-- 「枫」是一级字（GB2312 23 区），所以旧结论「一级字必然有字形」是错的，池子不能靠删字解决。
+--
+-- 但游戏**自带四套 CJK 字体**（sc / tc / jp / kr），繁中的定义本身就已经用了 fallback 链
+--（ui_fonts_definitions.lua：zh-tw 的 sans_serif = { noto_sans_tc_bold, noto_sans_sc_bold }）。
+-- 所以只要把每个字体名都叠成四套链即可 —— **不需要内置任何字体文件**。
+--
+-- 做法：hook `Managers.font._setup_font_definitions`，**在参数上**补链。
+-- 这样无论官方初始化、还是别的字体 mod（例如 show_cjk_glyphs —— 它只补了 sans_serif / serif，
+-- 漏掉 machine_medium）来设置，最终生效的都带链，互不冲突；我们再主动应用一次当前定义。
+
+local CJK_LANGS = { "sc", "tc", "jp", "kr" }
+
+local function build_cjk_chain(value, weight)
+	local chain = {}
+	local seen = {}
+
+	local function push(name)
+		if type(name) == "string" and name ~= "" and not seen[name] then
+			seen[name] = true
+			chain[#chain + 1] = name
+		end
+	end
+
+	if type(value) == "table" then
+		for i = 1, #value do
+			push(value[i])
+		end
+	else
+		push(value)
+	end
+
+	for i = 1, #CJK_LANGS do
+		push("noto_sans_" .. CJK_LANGS[i] .. "_" .. weight)
+	end
+
+	return chain
+end
+
+local cjk_font_types_cache
+
+local function cjk_font_types()
+	if cjk_font_types_cache then
+		return cjk_font_types_cache
+	end
+
+	local ok, definitions = pcall(function ()
+		return mod:original_require("scripts/managers/ui/ui_fonts_definitions")
+	end)
+
+	if not ok or type(definitions) ~= "table" then
+		cjk_font_types_cache = { sans_serif = "sans_serif", serif = "serif" }
+
+		return cjk_font_types_cache
+	end
+
+	local types = definitions.FontTypes or {}
+
+	cjk_font_types_cache = {
+		sans_serif = types.sans_serif or "sans_serif",
+		serif = types.serif or "serif",
+		definitions = definitions,
+	}
+
+	return cjk_font_types_cache
+end
+
+-- 就地补链（只认 string / table，别的原样留着）
+local function patch_font_definitions(font)
+	if type(font) ~= "table" then
+		return font
+	end
+
+	local types = cjk_font_types()
+
+	local function patch(key, weight)
+		local value = font[key]
+
+		if type(value) == "table" or type(value) == "string" then
+			font[key] = build_cjk_chain(value, weight)
+		end
+	end
+
+	patch("machine_medium", "black")
+	patch(types.sans_serif, "bold")
+	patch(types.serif, "black")
+
+	return font
+end
+
+-- 加载游戏自带的四个 CJK 字体包（游戏自己的包管理器是幂等的）
+local function load_cjk_font_packages()
+	local package_manager = Managers.package
+
+	if not package_manager or type(package_manager.load) ~= "function" then
+		return
+	end
+
+	local packages = {
+		"packages/ui/fonts/slug_zh_cn",
+		"packages/ui/fonts/slug_zh_tw",
+		"packages/ui/fonts/slug_ja",
+		"packages/ui/fonts/slug_ko",
+	}
+
+	for i = 1, #packages do
+		pcall(function ()
+			package_manager:load(packages[i], "anon_names", nil, true)
+		end)
+	end
+end
+
+-- 主动把「当前语言的定义」重设一次 —— hook 只保证**之后**被设置的定义带链
+local function apply_cjk_font()
+	local font_manager = Managers.font
+
+	if not font_manager or type(font_manager._setup_font_definitions) ~= "function" then
+		return false
+	end
+
+	local types = cjk_font_types()
+	local definitions = types.definitions
+
+	if type(definitions) ~= "table" then
+		return false
+	end
+
+	local locale = Managers.localization and Managers.localization:language() or "zh-cn"
+	local locale_fonts = (definitions.locale_specific_fonts or {})[locale] or {}
+
+	local font = patch_font_definitions({
+		machine_medium = locale_fonts.machine_medium,
+		[types.sans_serif] = locale_fonts[types.sans_serif],
+		[types.serif] = locale_fonts[types.serif],
+	})
+
+	local ok = pcall(function ()
+		font_manager:_setup_font_definitions(font)
+	end)
+
+	if not ok then
+		return false
+	end
+
+	mod._cjk_font_applied = true
+
+	return true
+end
+
+local function install_cjk_font(force)
+	if mod._cjk_font_installed and not force then
+		return true
+	end
+
+	if mod:get("cjk_font_fallback") == false then
+		return false
+	end
+
+	load_cjk_font_packages()
+
+	local font_manager = Managers.font
+
+	if not font_manager or type(font_manager._setup_font_definitions) ~= "function" then
+		return false
+	end
+
+	if not mod._cjk_font_hooked then
+		local ok = pcall(function ()
+			mod:hook(font_manager, "_setup_font_definitions", function (func, self, font)
+				return func(self, patch_font_definitions(font))
+			end)
+		end)
+
+		if not ok then
+			mod:warning("[anon_names] cjk font hook failed")
+
+			return false
+		end
+
+		mod._cjk_font_hooked = true
+	end
+
+	mod._cjk_font_installed = true
+
+	if apply_cjk_font() then
+		mod:info("[anon_names] cjk font fallback applied (machine_medium / sans_serif / serif)")
+	end
+
+	return true
+end
+
 mod.on_all_mods_loaded = function (self)
 	-- 注意：**不要**在这里预热「我的角色」集合 —— on_all_mods_loaded 发生在游戏世界就绪之前，
 	-- 那时 fetch_all_profiles() 会因 master data 未就绪报 BackendError（弹错误 + 游戏进 error state），
@@ -1118,6 +1313,9 @@ mod.on_all_mods_loaded = function (self)
 	-- 头顶名牌：vanilla 直接读 profile.name（真名），绕过全部钩子
 	pcall(install_nameplate_hooks)
 
+	-- 中文字体 fallback：修「一级字也变方块」（游戏字体子集 = 本地化文本用字）
+	pcall(install_cjk_font)
+
 	-- 补 AnonPlayers 没覆盖的账号名出口（presence account_name）
 	pcall(install_account_name_hooks)
 
@@ -1128,6 +1326,18 @@ mod.on_all_mods_loaded = function (self)
 	end
 
 	mod:warning("[anon_names] AnonPlayers not found or not hookable; aliases stay inactive")
+end
+
+mod.on_setting_changed = function (self, setting_id)
+	if setting_id == "cjk_font_fallback" then
+		if mod:get("cjk_font_fallback") == false then
+			mod:info("[anon_names] cjk font fallback disabled (需重进界面/重启才完全生效)")
+
+			return
+		end
+
+		pcall(install_cjk_font, true)
+	end
 end
 
 -- ##########################################################

@@ -67,4 +67,8 @@ return {
 		en = "Show the game's original bot name",
 		["zh-cn"] = "机器人显示游戏原名",
 	},
+	cjk_font_fallback = {
+		en = "CJK font fallback (fix missing glyph boxes)",
+		["zh-cn"] = "中文字体补全（修方块字）",
+	},
 }
