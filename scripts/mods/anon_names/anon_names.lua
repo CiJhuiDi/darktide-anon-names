@@ -1,22 +1,30 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.0.6
+	匿名名池 (Anon Names) v1.1.0
 	Author: CiJhuiDi
 
-	AnonPlayers 的附属：不改它「谁该被匿名」的决定，只替换「用什么名字」。
+	AnonPlayers 的附属：把它给出的掩码换成中文意象化名。
 
-	接入点：包住 AnonPlayers 的 mod.anonymize(profile, real_name, is_account)。
-	它 8 个 CLASS 钩子全部通过 mod.anonymize(...) 出结果，所以只在这一处拦截即可全覆盖：
-		PlayerInfo.character_name / user_display_name（后者被它 hook_origin 独占，不能碰）
-		RemotePlayer.name / character_name、HumanPlayer.name、BotPlayer.name
-		PresenceEntryMyself / PresenceEntryImmaterium.character_name
-		profile_utils.character_name
+	判定（A 方案，2026-10-12 收口 —— **只有一条规则**）：
+	    profile 属于「我账号下的角色」 → 放行真名
+	    确证不属于                    → 换化名
+	    判定不了                      → 什么都不做（返回上游结果）
+	不再回读上游的「他人」设置、也不再猜 `masked == real_name` 是什么含义 ——
+	旧版把判据叠成五层，v1.0.1 / v1.0.3 两次「修一个引入一个」都出在那里。
+	已知代价：不再跟随 AnonPlayers 的「其他账户名称 / 其他玩家」设置（设成「不匿名」时
+	本 mod 依然会化名）。本 mod 的定位就是「别人一律化名」。
 
-	判据：func() 返回真名 = AnonPlayers 决定不匿名（掩码模式 0），原样放行；
-	      返回别的 = 已被匿名，换成节气／花草化名。
+	接入的出口：
+	  * AnonPlayers 的 mod.anonymize —— 它 8 个 CLASS 钩子都从这一处出结果
+	    （PlayerInfo.character_name / user_display_name、RemotePlayer.name / character_name、
+	      HumanPlayer.name、BotPlayer.name、PresenceEntry*.character_name、profile_utils.character_name）
+	  * presence 的 account_name —— AnonPlayers 完全没覆盖，实测会返回真名（Huanyan#6301 这种）
+	  * 头顶名牌 —— vanilla 模板**直接读 profile.name**，绕过全部钩子
+	    （做法：在模板 update_function 里、vanilla 取数之前把 profile.name 换成化名；
+	      改 widget 会与 vanilla 每帧互相覆盖 → 名牌疯狂闪烁）
 
-	因此与 AnonPlayers 的 6 个设置项互不干扰，也不依赖加载顺序。
-	同一玩家全程同一个化名（按 account_id/character_id 稳定哈希 + 缓存）。
+	调试入口见文件尾「诊断后门」一节（debug_state / debug_explain / debug_trace / ...）。
+	同一玩家全程同一个化名（key 统一到 account_id + 哈希结果缓存）。
 ]]
 
 local mod = get_mod("anon_names")
@@ -459,18 +467,85 @@ local CHARACTER_REFRESH_INTERVAL = 10
 --  profiles_service.lua:196 ← master_items.lua:117 `rawget` got nil）。
 -- 游戏自己的 account_service 也会调它，但我们没必要在最危险的窗口里插一脚；
 -- 更关键的是：那一次失败会让本 mod 的「我的角色」集合建不起来 → 判据退化成 nil → **放行真名**。
-local function game_world_ready()
+-- 取本机玩家。**必须用 local_player_safe**：
+-- local_player() 直接走 Network.peer_id()，在连接初始化之前调用会**在 native 层崩溃**，
+-- pcall 拦不住 C 层崩溃（崩溃日志栈顶就是 `[C]: in function peer_id`）。游戏自己为此
+-- 提供了 safe 版，它会先查 Managers.connection:is_initialized()。
+-- 2026-10-10 实证：mod.update 从第一帧开始轮询 → local_player(1) → crash dump。
+local function get_local_player()
 	local player_manager = Managers.player
 
-	if not player_manager or type(player_manager.local_player) ~= "function" then
-		return false
+	if not player_manager or type(player_manager.local_player_safe) ~= "function" then
+		return nil
 	end
 
 	local ok, local_player = pcall(function ()
-		return player_manager:local_player(1)
+		return player_manager:local_player_safe(1)
 	end)
 
-	return ok and local_player ~= nil and local_player._profile ~= nil
+	if ok then
+		return local_player
+	end
+
+	return nil
+end
+
+local function game_world_ready()
+	local local_player = get_local_player()
+
+	return local_player ~= nil and local_player._profile ~= nil
+end
+
+-- 本机身份（当前出战角色 + 账号 id），缓存 1 秒。
+-- 判定在 hot path 上（日志实测单个玩家约 95 次/秒），不能每次都走一遍 local_player_safe。
+-- 换角色后最多 1 秒内仍按旧身份判定，可以接受（界面刷新远快于这个量级）。
+local identity_cache = { profile = nil, account_id = nil, at = -1 }
+local IDENTITY_TTL = 1
+
+local function local_identity()
+	local now = os.time and os.time() or nil
+
+	if identity_cache.profile and now and identity_cache.at >= 0 and (now - identity_cache.at) < IDENTITY_TTL then
+		return identity_cache
+	end
+
+	identity_cache.profile = nil
+
+	local local_player = get_local_player()
+
+	if local_player then
+		identity_cache.profile = local_player._profile
+
+		if type(local_player.account_id) == "function" then
+			local ok, account_id = pcall(function ()
+				return local_player:account_id()
+			end)
+
+			if ok and type(account_id) == "string" and account_id ~= "" then
+				identity_cache.account_id = account_id
+			end
+		end
+	end
+
+	-- 世界还没起来时，presence 的「我自己」仍可能给出账号 id
+	if not identity_cache.account_id then
+		local presence = Managers.presence
+		local myself = presence and presence._myself
+
+		if myself and type(myself.account_id) == "function" then
+			local ok, account_id = pcall(function ()
+				return myself:account_id()
+			end)
+
+			if ok and type(account_id) == "string" and account_id ~= "" then
+				identity_cache.account_id = account_id
+			end
+		end
+	end
+
+	identity_cache.at = now or -1
+
+	return identity_cache
 end
 
 local function refresh_my_characters()
@@ -535,41 +610,43 @@ local function refresh_my_characters()
 	end)
 end
 
--- 「是不是我」的三态判定：true = 确定是我 / false = 确定不是我 / **nil = 判定不了**。
--- 调用方**只有拿到 false（确证是别人）才允许覆盖上游放行的真名**；nil 必须放行。
+-- 判定追踪（给诊断后门用，默认关）。关着时只有一次 boolean 判断的开销。
+-- trace_record 先声明成空函数，文件尾部的诊断段会把它换成真的实现。
+local trace_enabled = false
+local trace_buffer = { n = 0 }
+local trace_record = function () end
+
+-- ##########################################################
+-- ################## 唯一的判定：这是不是我 ##################
+-- A 方案（2026-10-12 收口）。旧版把判据叠成了五层：
+--     三态判定 / others_masked 回读上游设置 / `masked == real_name` 分支 /
+--     窗口期保守回退 / 账号名那套独立判定
+-- 每一层都在替「上游为什么返回这个值」做假设 —— v1.0.1 和 v1.0.3 两次
+-- 「修一个引入一个」都出在这里（一次误伤自己、一次窗口期放真名）。
 --
+-- 现在只有一条规则：
+--     profile 属于「我账号下的角色」 → 放行真名
+--     确证不属于                    → 换化名
+--     判定不了                      → 什么都不做（返回上游结果）
+--
+-- 已知代价（明确接受）：不再跟随上游的「其他账户名称 / 其他玩家」设置 ——
+-- 那些设置若设成「不匿名」，本 mod 依然会化名。本 mod 的定位就是「别人一律化名」。
+--
+-- 三态：true = 我 / false = 确证是别人 / nil = 判定不了。
 -- 判据优先级：
 --   1. 引用相同（hub / 任务里 hook 收到的就是同一个 profile 表）
---   2. **「我的角色」集合**（最强）：在集合里 = 我；集合已加载且不在其中 = 确证是别人
---   3. character_id 与 local_player 的当前角色相同 → 我
---   4. account_id 与 local_player:account_id() 相同 → 我
+--   2. **「我的角色」集合**：在集合里 = 我；集合已加载且不在其中 = 确证是别人
+--   3. 集合没加载好时：cid 与本机当前角色不同 → 保守判别人（宁可多化名，不放真名）
+--   4. 没有 cid 时退回 account_id 比对
 -- 都不成立 → nil。
 local function local_profile_state(profile)
 	if type(profile) ~= "table" then
 		return nil
 	end
 
-	local player_manager = Managers.player
-	local my_profile
-	local my_account_id
-
-	if player_manager and type(player_manager.local_player) == "function" then
-		local ok, local_player = pcall(function ()
-			return player_manager:local_player(1)
-		end)
-
-		if ok and local_player then
-			my_profile = local_player._profile
-
-			local ok_acc, account_id = pcall(function ()
-				return local_player:account_id()
-			end)
-
-			if ok_acc then
-				my_account_id = account_id
-			end
-		end
-	end
+	local identity = local_identity()
+	local my_profile = identity.profile
+	local my_account_id = identity.account_id
 
 	if type(my_profile) == "table" and my_profile == profile then
 		return true
@@ -583,6 +660,13 @@ local function local_profile_state(profile)
 			return true
 		end
 
+		-- 先催一次集合加载（内部自带 game_world_ready 守卫 + 10 秒节流）。
+		-- **必须放在下面任何 return 之前**：否则「查询到我的非当前角色」这条路径
+		-- 永远催不起集合，判据就永远停在保守回退上，把玩家自己的其他角色一直
+		-- 判成别人。实测（本机 hub，账号 7 个角色）：直接查其他 6 个 → 全部换成
+		-- 池名；先查一次当前角色触发加载，2 秒后同一批角色立刻全部放行。
+		refresh_my_characters()
+
 		if my_characters_loaded then
 			-- 集合里有本账号全部角色，不在其中就是别人 —— 这是修主菜单泄漏的关键一票
 			return false
@@ -591,15 +675,13 @@ local function local_profile_state(profile)
 		-- 集合还没建好（启动后那几秒 / 请求失败）：退回 v1.0.2 的判据 ——
 		-- 与当前角色不同就**确证是别人**。宁可在这几秒里把「我的其他角色」也化名，
 		-- 也不能把真名放出去（2026-10-09 日志实证：启动后 27~36 秒泄漏了 1279 次真名）。
-		-- 角色选择界面里 local_player 通常还不存在 → my_profile 为 nil → 不会走到这里，所以不误伤。
+		-- 注意 hub 里 local_player 是**存在**的（就是当前选中的 operative），所以这段
+		-- 确实会短暂误伤「我的其他角色」；上面那次 refresh 就是把这个窗口压到最短。
 		local mine = type(my_profile) == "table" and my_profile.character_id
 
 		if type(mine) == "string" and mine ~= "" and mine ~= character_id then
 			return false
 		end
-
-		-- 催一次（内部会先检查游戏世界是否就绪）
-		refresh_my_characters()
 	end
 
 	if type(my_profile) == "table" then
@@ -621,26 +703,6 @@ local function local_profile_state(profile)
 	return nil
 end
 
--- 上游的「他人」设置是否要求匿名。0 = 用户明确要求不匿名他人（含账号名），照抄真名；
--- 其余值（含读不到）按「应当匿名」处理 —— 拿不准时宁可匿名，这是本 mod 的定位。
-local function others_masked(is_account)
-	local anon_mod = get_mod("AnonPlayers")
-
-	if not anon_mod or type(anon_mod.get) ~= "function" then
-		return true
-	end
-
-	local ok, value = pcall(function ()
-		return anon_mod:get(is_account and "anon_other_accounts" or "anon_others")
-	end)
-
-	if not ok then
-		return true
-	end
-
-	return value ~= 0 and value ~= false
-end
-
 -- ##########################################################
 -- ################## 账号名兜底 ############################
 -- AnonPlayers 只 hook 了 PlayerInfo.user_display_name，**完全没碰 account_name /
@@ -648,8 +710,8 @@ end
 --     entry:character_name() → 化名 ✓
 --     entry:account_name()   → Huanyan#6301（真名）✗
 -- 而反编译源码**恰好缺 ui/ 目录**（UI 在字节码里），无法排除界面直接取账号名来显示。
--- 这里按与主路径同一套判定补一层：我自己放行（尊重 anon_my_account = 0），
--- 别人且上游「他人」设置要求匿名时换成化名；化名 key 用账号 id，与角色名保持一致。
+-- 这里用与主路径**同一条规则**补一层：是我 → 放行；否则换化名
+--（化名 key 与角色名共用，保证同一个人处处同名）。
 
 local function local_account_id()
 	-- presence 的「我自己」最可靠：hub 和主菜单都在
@@ -668,19 +730,15 @@ local function local_account_id()
 
 	local player_manager = Managers.player
 
-	if player_manager and type(player_manager.local_player) == "function" then
-		local ok, local_player = pcall(function ()
-			return player_manager:local_player(1)
+	local local_player = player_manager and get_local_player()
+
+	if local_player and type(local_player.account_id) == "function" then
+		local ok_acc, value = pcall(function ()
+			return local_player:account_id()
 		end)
 
-		if ok and local_player and type(local_player.account_id) == "function" then
-			local ok_acc, value = pcall(function ()
-				return local_player:account_id()
-			end)
-
-			if ok_acc and type(value) == "string" and value ~= "" then
-				return value
-			end
+		if ok_acc and type(value) == "string" and value ~= "" then
+			return value
 		end
 	end
 
@@ -692,10 +750,6 @@ local function mask_account_name(self, name)
 	local pool = POOLS[style]
 
 	if type(name) ~= "string" or name == "" or not style or style == "off" or not pool then
-		return name
-	end
-
-	if not others_masked(true) then
 		return name
 	end
 
@@ -806,6 +860,17 @@ mod.rewrite_mask = function (profile, real_name, is_account, masked)
 		return masked
 	end
 
+	-- 唯一的判定（A 方案，2026-10-12 收口）：
+	--   我 → 真名；确证是别人 → 化名；判定不了 → 不介入（返回上游结果）。
+	-- 不再回读上游的「他人」设置、也不再猜 `masked == real_name` 是什么含义。
+	local mine = local_profile_state(profile)
+
+	trace_record(profile, mine, masked)
+
+	if mine == true then
+		return real_name
+	end
+
 	local bot = bot_key(profile)
 
 	if bot then
@@ -820,16 +885,12 @@ mod.rewrite_mask = function (profile, real_name, is_account, masked)
 			-- 关：保持 AnonPlayers 的处理结果（通常是 ???）
 			return masked
 		end
-	elseif masked == real_name then
-		-- 上游返回真名。**只有确证是别人、且上游的他人设置要求匿名时才覆盖**；
-		-- 是我、或判定不了（nil）一律放行 —— 绝不能把玩家自己的名字改掉
-		if local_profile_state(profile) ~= false or not others_masked(is_account) then
-			return masked
-		end
+	elseif mine == nil then
+		-- 判定不了就不动 —— 宁可少藏一层，也不能把玩家自己的名字改掉
+		return masked
 	end
 
-	-- 账号名要不要匿名完全由 AnonPlayers 的「其他账户名称 / 你的账户名称」决定，
-	-- 本 mod 不再叠加自己的一层开关 —— 它匿名我们就换化名，它放行我们就放行
+	-- key：统一到 account_id（同一个人跨角色、跨界面只用同一个化名）
 	local key = bot or alias_key(profile, real_name, is_account)
 
 	if not key then
@@ -893,14 +954,169 @@ if not ok_early then
 	mod:info("[anon_names] early hook skipped: %s", tostring(err_early))
 end
 
+-- ##########################################################
+-- ################## 头顶名牌兜底 ##########################
+-- vanilla 的头顶名牌（hub 与任务各一个模板）**直接读 profile.name**，也就是原始真名；
+-- 它不经过 AnonPlayers 的任何钩子，也不经过本 mod 的 rewrite_mask —— 实测同一时刻：
+-- bot 的 rewrite_mask 调用 129 次，而人类队友只有 21 次，人类名牌根本不在那条链上。
+--
+-- 注意**不能**在模板写完之后再去改 widget：vanilla 每帧都会用 profile.name 重写一次，
+-- 两边于是每帧互相覆盖、每帧都置 widget.dirty —— 实测表现就是**名牌疯狂闪烁**。
+-- 正确做法是在 vanilla 取数**之前**把 profile.name 换成化名，让它自己写出化名。
+local NAMEPLATE_TEMPLATE_PATHS = {
+	"scripts/ui/hud/elements/world_markers/templates/world_marker_template_nameplate",
+	"scripts/ui/hud/elements/world_markers/templates/world_marker_template_nameplate_party_hud",
+	"scripts/ui/hud/elements/world_markers/templates/world_marker_template_nameplate_combat",
+}
+
+-- 弱键表：记录 profile 的**原始真名**（profile.name 会被我们改写，所以要留底）。
+-- 旧实现只记「换成了什么」，于是运行中切风格不再更新、设成「关闭」也不恢复（P2）。
+local nameplate_originals = setmetatable({}, { __mode = "k" })
+
+-- 同一个模板表只 hook 一次。mod:hook_require 的回调**每次文件被重新 require 都会重放**
+--（DMF 自己的注释也这么说），不守卫就会叠成多层 hook，日志里体现为
+-- "Attempting to rehook active hook [update_function]"。
+local hooked_nameplate_templates = {}
+
+local function mask_profile_name(profile)
+	if type(profile) ~= "table" then
+		return
+	end
+
+	local current = profile.name
+
+	if type(current) ~= "string" or current == "" then
+		return
+	end
+
+	-- 第一次见到就留底；之后 profile.name 是我们的化名，不能拿它当"真名"再算一遍
+	local real = nameplate_originals[profile]
+
+	if not real then
+		real = current
+		nameplate_originals[profile] = real
+	end
+
+	-- 每次都拿**原真名**重算：切风格自动更新，风格设成「关闭」时 rewrite_mask 会
+	-- 返回原真名，于是这里把 profile.name 恢复回去。
+	local masked = mod.rewrite_mask(profile, real, false, real)
+
+	if type(masked) ~= "string" or masked == "" then
+		masked = real
+	end
+
+	if profile.name == masked then
+		return
+	end
+
+	profile.name = masked
+end
+
+local function mask_marker_profile(marker)
+	local player = marker and marker.data
+
+	if type(player) ~= "table" then
+		return
+	end
+
+	local profile = player._profile
+
+	if type(profile) == "table" then
+		mask_profile_name(profile)
+
+		return
+	end
+
+	local ok, resolved = pcall(player.profile, player)
+
+	if ok and type(resolved) == "table" then
+		mask_profile_name(resolved)
+	end
+end
+
+local function install_nameplate_hooks()
+	local hooked_any = false
+
+	for i = 1, #NAMEPLATE_TEMPLATE_PATHS do
+		local path = NAMEPLATE_TEMPLATE_PATHS[i]
+
+		local ok = pcall(function ()
+			mod:hook_require(path, function (template)
+				if type(template) ~= "table" or type(template.update_function) ~= "function" then
+					return
+				end
+
+				if hooked_nameplate_templates[template] then
+					return
+				end
+
+				hooked_nameplate_templates[template] = true
+
+				mod:hook(template, "update_function", function (func, parent, ui_renderer, widget, marker, template_arg, dt, t)
+					-- 先换数据，再让 vanilla 自己写 widget —— 这样它写出来的就是化名，
+					-- widget.dirty 也只由它按需置一次，不会闪烁。
+					pcall(mask_marker_profile, marker)
+
+					return func(parent, ui_renderer, widget, marker, template_arg, dt, t)
+				end)
+			end)
+
+			hooked_any = true
+		end)
+
+		if not ok then
+			mod:warning("[anon_names] nameplate hook failed for %s", path)
+		end
+	end
+
+	return hooked_any
+end
+
+-- 预热「我的全部角色」集合。
+-- 界面（尤其主菜单 / 角色选择）会在**一帧之内**连续查询我的所有角色，而
+-- fetch_all_profiles() 是异步的 —— 等第一次查询再惰性触发根本来不及：那一帧全部落进
+-- 保守回退，自己的角色被换成池名，而且界面渲染完就缓存住了，之后也不会再查一次。
+-- 这里改成进入游戏世界后主动轮询，game_world_ready() 一成立就拉，远早于用户打开界面。
+local last_warmup_second = -1
+local warmup_disabled = false
+
+local function warmup_my_characters()
+	if warmup_disabled or my_characters_loaded then
+		return
+	end
+
+	local now = os.time and os.time() or nil
+
+	-- 每秒最多试一次；refresh_my_characters 内部还有 10 秒节流 + game_world_ready 守卫
+	if now and now == last_warmup_second then
+		return
+	end
+
+	last_warmup_second = now or last_warmup_second
+	refresh_my_characters()
+end
+
+mod.update = function (self, dt)
+	local ok, err = pcall(warmup_my_characters)
+
+	if not ok then
+		-- 预热只是锦上添花：一旦出任何错就永久关掉，绝不拖累游戏
+		warmup_disabled = true
+		mod:warning("[anon_names] warmup disabled after error: %s", tostring(err))
+	end
+end
+
 mod.on_all_mods_loaded = function (self)
 	-- 注意：**不要**在这里预热「我的角色」集合 —— on_all_mods_loaded 发生在游戏世界就绪之前，
 	-- 那时 fetch_all_profiles() 会因 master data 未就绪报 BackendError（弹错误 + 游戏进 error state），
 	-- 而且它一失败集合就建不起来 → 判据退化 → 放行真名。
-	-- refresh_my_characters() 内部有 game_world_ready() 守卫，会在进入世界后由 rewrite_mask 惰性触发。
+	-- refresh_my_characters() 内部有 game_world_ready() 守卫，进入世界后由 mod.update 主动轮询。
 
 	-- 预热 cid→account_id 映射：只读 presence / players，安全
 	pcall(refresh_character_accounts)
+
+	-- 头顶名牌：vanilla 直接读 profile.name（真名），绕过全部钩子
+	pcall(install_nameplate_hooks)
 
 	-- 补 AnonPlayers 没覆盖的账号名出口（presence account_name）
 	pcall(install_account_name_hooks)
@@ -912,4 +1128,142 @@ mod.on_all_mods_loaded = function (self)
 	end
 
 	mod:warning("[anon_names] AnonPlayers not found or not hookable; aliases stay inactive")
+end
+
+-- ##########################################################
+-- ################## 诊断后门 ##############################
+-- 收口之后判据只剩一条规则，但「这个人为什么被判成别人」还得能查。
+-- 这些入口只在排查时用，正常流程一次都不经过。
+-- 游戏里用 dt-cli 调（get_mod 拿到本 mod）：
+--     nn.debug_state()            -- 状态快照：集合 / 映射 / 身份 / 缓存 / hook
+--     nn.debug_explain(profile)   -- 对某个 profile 复算判定，列出每一步
+--     nn.debug_alias(key)         -- 这个 key 会拿到什么化名
+--     nn.debug_trace(true)        -- 开判定追踪（默认关，环形 300 条）
+--     nn.debug_trace_dump()       -- 读追踪
+--     nn.debug_refresh()          -- 强制重拉「我的角色」集合 + cid→账号映射
+--     nn.debug_set(k, v)          -- 改设置并立即生效（等价于界面里改）
+
+local function count_keys(tbl)
+	local n = 0
+
+	for _ in pairs(tbl) do
+		n = n + 1
+	end
+
+	return n
+end
+
+trace_record = function (profile, state, masked)
+	if not trace_enabled then
+		return
+	end
+
+	local buffer = trace_buffer
+	buffer.n = buffer.n + 1
+	buffer[((buffer.n - 1) % 300) + 1] = string.format("cid=%s acc=%s state=%s masked=%s",
+		type(profile) == "table" and tostring(profile.character_id) or "nil",
+		type(profile) == "table" and tostring(profile.account_id) or "nil",
+		tostring(state), tostring(masked))
+end
+
+mod.debug_state = function ()
+	local identity = local_identity()
+
+	return {
+		style = mod:get("mask_style"),
+		bot_handling = mod:get("bot_handling"),
+		hooked = mod._hooked == true,
+		account_name_hooked = mod._account_hooked == true,
+		my_characters_loaded = my_characters_loaded,
+		my_character_count = count_keys(my_character_ids),
+		account_map_count = count_keys(character_accounts),
+		alias_cache_count = alias_cache_count,
+		my_account_id = identity.account_id,
+		my_character_id = type(identity.profile) == "table" and identity.profile.character_id or nil,
+		trace_enabled = trace_enabled,
+	}
+end
+
+mod.debug_explain = function (profile)
+	local identity = local_identity()
+	local is_table = type(profile) == "table"
+	local character_id = is_table and profile.character_id or nil
+	local account_id = is_table and profile.account_id or nil
+	local state = local_profile_state(profile)
+
+	local steps = {
+		"profile 引用         = " .. tostring(profile),
+		"本机 profile 引用    = " .. tostring(identity.profile),
+		"引用相同?            = " .. tostring(identity.profile == profile),
+		"profile.character_id = " .. tostring(character_id),
+		"本机 character_id    = " .. tostring(type(identity.profile) == "table" and identity.profile.character_id or nil),
+		"「我的角色」集合      = " .. count_keys(my_character_ids) .. " 项 (loaded=" .. tostring(my_characters_loaded) .. ")",
+		"cid 在集合里?         = " .. tostring(type(character_id) == "string" and my_character_ids[character_id] == true),
+		"profile.account_id   = " .. tostring(account_id),
+		"本机 account_id      = " .. tostring(identity.account_id),
+		"是机器人?            = " .. tostring(bot_key(profile) ~= nil),
+	}
+
+	return {
+		state = state,
+		verdict = state == true and "我 → 放行真名" or (state == false and "别人 → 换化名" or "判定不了 → 不介入"),
+		steps = steps,
+	}
+end
+
+mod.debug_alias = function (key, style)
+	local pool = POOLS[style or mod:get("mask_style")]
+
+	if not pool or type(key) ~= "string" or key == "" then
+		return nil
+	end
+
+	return pool[(hash_string(key) % #pool) + 1]
+end
+
+mod.debug_trace = function (enable)
+	trace_enabled = enable == true
+
+	if not trace_enabled then
+		trace_buffer = { n = 0 }
+	end
+
+	return trace_enabled
+end
+
+mod.debug_trace_dump = function ()
+	local out = {}
+	local buffer = trace_buffer
+
+	for i = 1, math.min(buffer.n, 300) do
+		if buffer[i] then
+			out[#out + 1] = buffer[i]
+		end
+	end
+
+	return out
+end
+
+mod.debug_refresh = function ()
+	my_characters_loaded = false
+	characters_logged = false
+	account_map_logged = false
+	last_character_refresh = -math.huge
+	last_account_map_refresh = -math.huge
+	warmup_disabled = false
+
+	pcall(refresh_my_characters)
+	pcall(refresh_character_accounts)
+
+	return mod.debug_state()
+end
+
+mod.debug_set = function (key, value)
+	if key ~= "mask_style" and key ~= "bot_handling" then
+		return false
+	end
+
+	mod:set(key, value, true)
+
+	return mod:get(key)
 end
