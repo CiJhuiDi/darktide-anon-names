@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.2.2
+	匿名名池 (Anon Names) v1.2.3
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：把它给出的掩码换成中文意象化名。

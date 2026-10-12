@@ -1,4 +1,4 @@
-# 匿名名池 (Anon Names) v1.2.2
+# 匿名名池 (Anon Names) v1.2.3
 
 《战锤 40K：暗潮》DMF mod：**AnonPlayers 的附属** —— 把它的掩码（`???` / 随机代码 / 性格名）换成中文意象化名。
 
