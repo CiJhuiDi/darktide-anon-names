@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.2.1
+	匿名名池 (Anon Names) v1.2.2
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：把它给出的掩码换成中文意象化名。
@@ -53,11 +53,11 @@ local SOLAR_TERMS = {
 -- 花草分五大类，每类都是独立的风格选项；flora = 五类合并
 local FLORA_FLOWER = {
 	-- 花木
-	"梅花", "兰花", "翠竹", "秋菊", "牡丹", "芍药", "海棠", "玉兰", "丁香",
-	"桂花", "山茶", "杜鹃", "含笑", "月季",
+	"梅花", "兰花", "翠竹", "秋菊", "牡丹", "海棠", "玉兰", "丁香",
+	"桂花", "山茶", "含笑", "月季",
 	"百合", "石竹", "雏菊", "莲花", "睡莲", "水仙", "兰草", "迎春", "瑞香",
 	"结香", "绣球", "龙胆", "麦冬", "文竹", "吊兰", "绿萝", "木棉", "合欢",
-	"槐花", "梨花", "桃花", "杏花", "樱花", "桔梗", "铃兰", "木香",
+	"槐花", "梨花", "桃花", "杏花", "樱花", "铃兰", "木香",
 	"紫荆", "腊梅", "垂丝海棠", "西府海棠", "贴梗海棠", "榆叶梅", "郁李", "紫叶李",
 	"美人梅", "珍珠梅", "绣线菊", "琼花", "天女花", "辛夷", "白兰", "黄兰",
 	"太平花",
@@ -65,8 +65,8 @@ local FLORA_FLOWER = {
 
 local FLORA_HERB = {
 	-- 草本
-	"薄荷", "紫苏", "艾草", "蒲公英", "车前草", "芦苇", "白茅", "狗尾草", "含羞草",
-	"三叶草", "芭蕉", "香蒲", "忍冬", "连翘",
+	"薄荷", "紫苏", "艾草", "车前草", "白茅", "狗尾草", "含羞草",
+	"三叶草", "芭蕉", "忍冬", "连翘",
 	"佩兰", "泽兰", "茵陈", "鱼腥草", "夏枯草",
 	"益母草", "灯心草", "凤仙", "锦葵", "秋葵", "罗勒", "迷迭香", "百里香",
 	"牛至", "鼠尾草", "香茅", "紫花地丁", "白头翁", "威灵仙", "金线莲",
@@ -83,11 +83,11 @@ local FLORA_VINE = {
 
 local FLORA_TREE = {
 	-- 树木
-	"银杏", "梧桐", "香樟", "青松", "翠柏", "垂柳", "红枫", "云杉", "白榆",
-	"古槐", "桑叶", "紫檀", "苏铁", "罗汉松", "红豆杉", "香椿",
+	"银杏", "梧桐", "香樟", "青松", "翠柏", "垂柳", "云杉", "白榆",
+	"古槐", "桑叶", "苏铁", "罗汉松", "红豆杉",
 	"水杉", "侧柏", "圆柏", "雪松", "油松", "马尾松", "冷杉", "泡桐",
-	"朴树", "黄连木", "枫香", "广玉兰", "冬青", "女贞",
-	"凤凰木", "白蜡", "五角枫", "元宝枫", "油茶", "核桃", "板栗",
+	"朴树", "黄连木", "广玉兰", "冬青", "女贞",
+	"凤凰木", "白蜡", "油茶", "核桃", "板栗",
 	"石榴", "杨梅", "樱桃",
 }
 
@@ -1131,6 +1131,9 @@ local function warmup_my_characters()
 	refresh_my_characters()
 end
 
+-- 前置声明：字体段（本文件下方）才给它赋值。直接在这里调用会被编译成全局查找，运行时 nil。
+local poll_cjk_font_packages
+
 mod.update = function (self, dt)
 	local ok, err = pcall(warmup_my_characters)
 
@@ -1138,6 +1141,11 @@ mod.update = function (self, dt)
 		-- 预热只是锦上添花：一旦出任何错就永久关掉，绝不拖累游戏
 		warmup_disabled = true
 		mod:warning("[anon_names] warmup disabled after error: %s", tostring(err))
+	end
+
+	-- CJK 字体包是异步加载的：包就绪之前不许装钩子/应用定义（见字体段的说明）
+	if poll_cjk_font_packages then
+		pcall(poll_cjk_font_packages)
 	end
 end
 
@@ -1212,30 +1220,49 @@ local function cjk_font_types()
 	return cjk_font_types_cache
 end
 
--- 就地补链（只认 string / table，别的原样留着）
+-- 补链。**返回新表，绝不就地改传进来的那张** —— 传进来的是
+-- `FontDefinitions.locale_specific_fonts[locale]` 本体，就地改会把全局定义污染成 table 值，
+-- 之后游戏自己调用 `_setup_font_definitions` 时就会在 `base_path .. value` 抛错。
+--
+-- 哪些键能给 table，由游戏源码定死（ui_font_manager.lua:74-100）：
+--   * 字体**类型**键（sans_serif / serif）：`type(font_fallback) == "table"` 会逐条展开成多条
+--     字体路径 —— 所以链是合法的，这也是 fallback 唯一能生效的入口。
+--   * **精确字体名**键：直接 `paths[#paths+1] = locale_fonts[font_name]`，随后和 base_path 拼接。
+--     给它 table 就是 "attempt to concatenate a table value"（实测抛在这里）。
 local function patch_font_definitions(font)
 	if type(font) ~= "table" then
 		return font
 	end
 
 	local types = cjk_font_types()
+	local patched = {}
 
-	local function patch(key, weight)
-		local value = font[key]
-
-		if type(value) == "table" or type(value) == "string" then
-			font[key] = build_cjk_chain(value, weight)
-		end
+	for key, value in pairs(font) do
+		patched[key] = value
 	end
 
-	patch("machine_medium", "black")
-	patch(types.sans_serif, "bold")
-	patch(types.serif, "black")
+	patched[types.sans_serif] = build_cjk_chain(font[types.sans_serif], "bold")
+	patched[types.serif] = build_cjk_chain(font[types.serif], "black")
 
-	return font
+	-- machine_medium 是**精确字体名**（FontDefinitions.fonts.machine_medium = sans_serif），
+	-- 而 zh-cn 的定义偏偏把它覆盖成**单个** noto_sans_sc_black —— 精确名分支只 push 一条路径，
+	-- 于是它永远拿不到回退链，这正是「一级字也变方块」的来源。
+	-- 删掉这个覆盖，它就落回上面刚补好的 sans_serif 链（代价是字重从 black 变 bold）。
+	patched.machine_medium = nil
+
+	return patched
 end
 
--- 加载游戏自带的四个 CJK 字体包（游戏自己的包管理器是幂等的）
+-- 游戏自带的四套 CJK 字体包。名字与 ShowCnJaKoGlyphsPlus 用的完全一致。
+local CJK_FONT_PACKAGES = {
+	"packages/ui/fonts/slug_zh_cn",
+	"packages/ui/fonts/slug_zh_tw",
+	"packages/ui/fonts/slug_ja",
+	"packages/ui/fonts/slug_ko",
+}
+
+-- 加载游戏自带的四个 CJK 字体包（游戏自己的包管理器是幂等的）。
+-- 注意：**这是异步的**，函数返回时包还没进内存 —— 见 all_cjk_font_packages_loaded。
 local function load_cjk_font_packages()
 	local package_manager = Managers.package
 
@@ -1243,18 +1270,63 @@ local function load_cjk_font_packages()
 		return
 	end
 
-	local packages = {
-		"packages/ui/fonts/slug_zh_cn",
-		"packages/ui/fonts/slug_zh_tw",
-		"packages/ui/fonts/slug_ja",
-		"packages/ui/fonts/slug_ko",
-	}
-
-	for i = 1, #packages do
+	for i = 1, #CJK_FONT_PACKAGES do
 		pcall(function ()
-			package_manager:load(packages[i], "anon_names", nil, true)
+			package_manager:load(CJK_FONT_PACKAGES[i], "anon_names", nil, true)
 		end)
 	end
+end
+
+-- 四个包是否都已在内存里。**这是这套 fallback 的前置条件，不是优化**：
+-- 链条里一旦写进 `noto_sans_tc_bold` 这类字体名，引擎在 sc 子集缺字形时就会回退到它；
+-- 而该字体所在的包没加载完时，引擎**不是跳过而是直接崩**：
+--     <<Crash>>Resource not loaded ... <<Script Error>>content/ui/fonts/noto_sans_tc_bold
+-- 2026-10-13 实证：on_all_mods_loaded 里发起异步加载、立刻装钩子并应用定义，
+-- 0.3 秒后标题界面刚绘制就崩在这里（连崩两次，日志一模一样）。
+local function all_cjk_font_packages_loaded()
+	local package_manager = Managers.package
+
+	if not package_manager or type(package_manager.has_loaded) ~= "function" then
+		return false
+	end
+
+	for i = 1, #CJK_FONT_PACKAGES do
+		if not package_manager:has_loaded(CJK_FONT_PACKAGES[i]) then
+			return false
+		end
+	end
+
+	return true
+end
+
+-- 装钩子（幂等）。**必须在包就绪之后**调用：钩子装上后，游戏自己每一次
+-- _setup_font_definitions 都会带上我们补的链，那时链条里的字体名必须已经可用。
+local function install_cjk_font_hook()
+	if mod._cjk_font_hooked then
+		return true
+	end
+
+	local font_manager = Managers.font
+
+	if not font_manager or type(font_manager._setup_font_definitions) ~= "function" then
+		return false
+	end
+
+	local ok = pcall(function ()
+		mod:hook(font_manager, "_setup_font_definitions", function (func, self, font)
+			return func(self, patch_font_definitions(font))
+		end)
+	end)
+
+	if not ok then
+		mod:warning("[anon_names] cjk font hook failed")
+
+		return false
+	end
+
+	mod._cjk_font_hooked = true
+
+	return true
 end
 
 -- 主动把「当前语言的定义」重设一次 —— hook 只保证**之后**被设置的定义带链
@@ -1275,11 +1347,11 @@ local function apply_cjk_font()
 	local locale = Managers.localization and Managers.localization:language() or "zh-cn"
 	local locale_fonts = (definitions.locale_specific_fonts or {})[locale] or {}
 
-	local font = patch_font_definitions({
-		machine_medium = locale_fonts.machine_medium,
-		[types.sans_serif] = locale_fonts[types.sans_serif],
-		[types.serif] = locale_fonts[types.serif],
-	})
+	-- 整张语言定义表送进去（patch_font_definitions 会先复制再补链）。
+	-- 早期版本只塞了 machine_medium / sans_serif / serif 三个键，游戏拿到的定义缺了其余字体名，
+	-- 那次调用必定抛错（实测 "attempt to concatenate a table value"）——
+	-- 也就是说「主动应用一次」这条路从来没走通过，fallback 只能靠 hook 在之后某次调用时补上。
+	local font = patch_font_definitions(locale_fonts)
 
 	local ok = pcall(function ()
 		font_manager:_setup_font_definitions(font)
@@ -1294,37 +1366,56 @@ local function apply_cjk_font()
 	return true
 end
 
-local function install_cjk_font(force)
-	if mod._cjk_font_installed and not force then
-		return true
+-- 每帧看一眼包加载完没有（mod.update 调用；前置声明见文件上方）。就绪之前什么都不做 ——
+-- 这正是修掉那次崩溃的地方。
+poll_cjk_font_packages = function ()
+	if mod:get("cjk_font_fallback") == false then
+		poll_cjk_font_packages = nil
+
+		return
 	end
 
+	if not all_cjk_font_packages_loaded() then
+		return
+	end
+
+	poll_cjk_font_packages = nil
+
+	if not install_cjk_font_hook() then
+		return
+	end
+
+	mod._cjk_font_installed = true
+
+	if apply_cjk_font() then
+		mod:info("[anon_names] cjk font fallback applied (machine_medium / sans_serif / serif)")
+	end
+end
+
+local function install_cjk_font(force)
 	if mod:get("cjk_font_fallback") == false then
 		return false
 	end
 
-	load_cjk_font_packages()
-
-	local font_manager = Managers.font
-
-	if not font_manager or type(font_manager._setup_font_definitions) ~= "function" then
-		return false
+	if mod._cjk_font_installed and not force then
+		return true
 	end
 
-	if not mod._cjk_font_hooked then
-		local ok = pcall(function ()
-			mod:hook(font_manager, "_setup_font_definitions", function (func, self, font)
-				return func(self, patch_font_definitions(font))
-			end)
-		end)
+	load_cjk_font_packages()
 
-		if not ok then
-			mod:warning("[anon_names] cjk font hook failed")
+	-- 包还没进内存：只交给 mod.update 轮询，**绝不**在这里装钩子或应用定义 ——
+	-- 那一步会让定义里出现尚未加载的字体名，引擎回退到它时直接崩（2026-10-13 那次）。
+	-- 包始终没就绪的代价只是「没有字形 fallback」，不会崩。
+	if not all_cjk_font_packages_loaded() then
+		mod:info("[anon_names] waiting for CJK font packages before applying fallback")
 
-			return false
-		end
+		return true
+	end
 
-		mod._cjk_font_hooked = true
+	poll_cjk_font_packages = nil
+
+	if not install_cjk_font_hook() then
+		return false
 	end
 
 	mod._cjk_font_installed = true
