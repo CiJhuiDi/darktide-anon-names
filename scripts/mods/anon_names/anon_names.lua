@@ -1,6 +1,6 @@
 -- chunkname: @scripts/mods/anon_names/anon_names.lua
 --[[
-	匿名名池 (Anon Names) v1.2.0
+	匿名名池 (Anon Names) v1.2.1
 	Author: CiJhuiDi
 
 	AnonPlayers 的附属：把它给出的掩码换成中文意象化名。
@@ -380,9 +380,20 @@ end
 -- 命中时返回稳定 key：用槽位 id 而不是 profile 里的名字，因为 BotPlayer.name() 会先
 -- 返回 _debug_name（"Bot Player 1"）再变成预置名，拿名字当 key 会让同一局内换化名。
 
+-- bot_key 的结果按 profile 缓存（弱键）。profile 与「是不是机器人」的对应关系在一局内不会变，
+-- 而这个名字查询是 hot path（实测约 95 次/秒/玩家）—— 省掉每次的 pcall + bot_players() + next()。
+-- 存 false 表示「确认不是机器人」，与「还没查过（nil）」区分开。
+local bot_key_cache = setmetatable({}, { __mode = "k" })
+
 local function bot_key(profile)
 	if not profile then
 		return nil
+	end
+
+	local cached = bot_key_cache[profile]
+
+	if cached ~= nil then
+		return cached or nil
 	end
 
 	local player_manager = Managers.player
@@ -400,16 +411,22 @@ local function bot_key(profile)
 	end
 
 	-- 绝大多数场合没有机器人：先短路，省掉下面的 pairs 遍历
-	--（bot_key 对**每一次**名字查询都会走一遍，是 hot path）
 	if next(bots) == nil then
+		bot_key_cache[profile] = false
+
 		return nil
 	end
 
 	for unique_id, bot in pairs(bots) do
 		if bot and bot._profile == profile then
-			return "bot:" .. tostring(bot._local_player_id or unique_id)
+			local key = "bot:" .. tostring(bot._local_player_id or unique_id)
+			bot_key_cache[profile] = key
+
+			return key
 		end
 	end
+
+	bot_key_cache[profile] = false
 
 	return nil
 end
@@ -665,7 +682,10 @@ local function local_profile_state(profile)
 		-- 永远催不起集合，判据就永远停在保守回退上，把玩家自己的其他角色一直
 		-- 判成别人。实测（本机 hub，账号 7 个角色）：直接查其他 6 个 → 全部换成
 		-- 池名；先查一次当前角色触发加载，2 秒后同一批角色立刻全部放行。
-		refresh_my_characters()
+		-- 加载完成后这里只做一次 boolean 判断，不再进函数（hot path）
+		if not my_characters_loaded then
+			refresh_my_characters()
+		end
 
 		if my_characters_loaded then
 			-- 集合里有本账号全部角色，不在其中就是别人 —— 这是修主菜单泄漏的关键一票
@@ -865,7 +885,10 @@ mod.rewrite_mask = function (profile, real_name, is_account, masked)
 	-- 不再回读上游的「他人」设置、也不再猜 `masked == real_name` 是什么含义。
 	local mine = local_profile_state(profile)
 
-	trace_record(profile, mine, masked)
+	-- 默认关闭，这里内联判断，省掉 hot path 上的一次函数调用
+	if trace_enabled then
+		trace_record(profile, mine, masked)
+	end
 
 	if mine == true then
 		return real_name
@@ -978,6 +1001,10 @@ local nameplate_originals = setmetatable({}, { __mode = "k" })
 -- "Attempting to rehook active hook [update_function]"。
 local hooked_nameplate_templates = {}
 
+-- 名牌每帧都会走到这里（在场玩家各一次），而 rewrite_mask 的结果在一局内是稳定的 ——
+-- 缓存「profile → { style, masked }」，只有风格变了才重算。
+local nameplate_cache = setmetatable({}, { __mode = "k" })
+
 local function mask_profile_name(profile)
 	if type(profile) ~= "table" then
 		return
@@ -997,19 +1024,27 @@ local function mask_profile_name(profile)
 		nameplate_originals[profile] = real
 	end
 
-	-- 每次都拿**原真名**重算：切风格自动更新，风格设成「关闭」时 rewrite_mask 会
-	-- 返回原真名，于是这里把 profile.name 恢复回去。
-	local masked = mod.rewrite_mask(profile, real, false, real)
+	local style = mod:get("mask_style") or "off"
+	local cached = nameplate_cache[profile]
+	local masked
 
-	if type(masked) ~= "string" or masked == "" then
-		masked = real
+	if cached and cached.style == style then
+		masked = cached.masked
+	else
+		-- 拿**原真名**重算：切风格自动更新；风格设成「关闭」时 rewrite_mask 会返回原真名，
+		-- 于是下面把 profile.name 恢复回去。
+		masked = mod.rewrite_mask(profile, real, false, real)
+
+		if type(masked) ~= "string" or masked == "" then
+			masked = real
+		end
+
+		nameplate_cache[profile] = { style = style, masked = masked }
 	end
 
-	if profile.name == masked then
-		return
+	if profile.name ~= masked then
+		profile.name = masked
 	end
-
-	profile.name = masked
 end
 
 local function mask_marker_profile(marker)
@@ -1476,4 +1511,31 @@ mod.debug_set = function (key, value)
 	mod:set(key, value, true)
 
 	return mod:get(key)
+end
+
+-- 单次判定开销的实测入口（hot path 每次名字查询都走 rewrite_mask）：
+--     nn.debug_bench()        -- 默认 20000 次
+--     nn.debug_bench(100000)
+-- 用一个"别人"的 profile 走完整路径 —— 我自己的 profile 会在 local_profile_state
+-- 那一步就 return real_name，测不到底下的 alias_key / alias_for。
+mod.debug_bench = function (iterations)
+	iterations = tonumber(iterations) or 20000
+
+	local profile = { character_id = "bench-0000-0000-0000-000000000000" }
+	local pool = POOLS[mod:get("mask_style")] or POOLS.jieqi
+	local t0 = os.clock()
+
+	for _ = 1, iterations do
+		mod.rewrite_mask(profile, "BENCH_NAME", nil, "???")
+	end
+
+	local dt = os.clock() - t0
+
+	return {
+		iterations = iterations,
+		pool_size = #pool,
+		total_seconds = dt,
+		per_call_us = dt / iterations * 1e6,
+		calls_per_second = iterations / math.max(dt, 1e-9),
+	}
 end
